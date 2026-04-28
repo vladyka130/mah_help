@@ -1,0 +1,29 @@
+# Віртуальне середовище та кеші Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Секрети та локальні налаштування
+.env
+.env.local
+
+# IDE та інструменти
+.idea/
+.vscode/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db

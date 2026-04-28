@@ -1,0 +1,18 @@
+customtkinter
+opencv-python
+mss
+numpy
+Pillow
+# База: https://github.com/smilee3998/mahjong_detection
+ipykernel
+mss
+roboflow
+python-dotenv
+ultralytics
+supervision
+opencv-python-headless
+pillow
+pyqt6
+tensorboard
+numpy
+jupyter
