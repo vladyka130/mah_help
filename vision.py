@@ -1,7 +1,18 @@
 from __future__ import annotations
 
+"""
+Розпізнавання плиток: OpenCV — основний інструмент.
+
+Для пошуку однакових (типових) плиток на скріншоті використовується
+``cv2.matchTemplate()`` (``TM_CCOEFF_NORMED``) по сірих шаблонах з ``assets/tiles``;
+масштаб підлаштовується, далі NMS / WTA. Порівняння двох ROI пари — теж через
+``matchTemplate`` (див. ``pair_patches_look_same``).
+"""
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import math
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -20,10 +31,18 @@ class TileMatch:
     y: int
     w: int
     h: int
+    # Середня яскравість ROI (0–255) після фільтра затемнення; 0 якщо не обчислювали.
+    luma_mean: float = 0.0
 
 
 class VisionEngine:
-    """Захват екрана та пошук плиток за шаблонами."""
+    """
+    Захоплення екрана та пошук плиток.
+
+    Ядро розпізнавання — OpenCV ``cv2.matchTemplate()``: для кожного типу плитки
+    шаблон порівнюється з кадром у градаціях сірого; збіги вище порога дають
+    кандидатів на ідентичні плитки на полі.
+    """
 
     def __init__(
         self,
@@ -34,14 +53,47 @@ class VisionEngine:
         auto_scale_range: Tuple[float, float] = (0.60, 1.40),
         auto_scale_step: float = 0.05,
         # Швидкий підбір масштабу (грубий крок + уточнення; прев’ю кадр; повторне використання попереднього s).
-        auto_scale_coarse_step: float = 0.09,
-        auto_scale_fine_step: float = 0.03,
-        auto_scale_fine_half_span: float = 0.15,
-        auto_scale_sample_templates: int = 6,
-        auto_scale_preview_max_side: int = 1280,
+        auto_scale_coarse_step: float = 0.11,
+        auto_scale_fine_step: float = 0.035,
+        auto_scale_fine_half_span: float = 0.12,
+        auto_scale_sample_templates: int = 4,
+        auto_scale_preview_max_side: int = 900,
         auto_scale_reuse: bool = True,
         auto_scale_reuse_half_span: float = 0.10,
         auto_scale_reuse_min_avg: float = 0.36,
+        # Затемнені фішки (як у референсних скрінах assets/reference_boards): не прибираються грою — відсікаємо за яскравістю.
+        filter_darkened_tiles: bool = True,
+        luma_inset_ratio: float = 0.10,
+        luma_min_cluster_separation: float = 10.0,
+        luma_min_matches: int = 6,
+        # Якщо після відсікання затемнення лишилось занадто мало детекцій — скасувати фільтр на цьому кадрі.
+        luma_rollback_min_keep_ratio: float = 0.52,
+        # Пороги matchTemplate між вирізами двох плиток (різні для «той самий шаблон» / різні типи / висока впевненість шаблону).
+        # Параметри сірого ROI + pair_edge_min_score (градієнти) разом зменшують плутанину «однаковий фон».
+        pair_visual_same_type: float = 0.51,
+        pair_visual_cross_type: float = 0.48,
+        # Augment: різні імена файлів шаблонів, один малюнок.
+        pair_visual_cross_augment: float = 0.46,
+        pair_trust_template_conf: float = 0.82,
+        pair_visual_if_trusted: float = 0.50,
+        # Майже вимкнено: ім’я шаблону/число в matchTemplate не замінює порівняння візерунка.
+        pair_skip_visual_min_conf: float = 0.995,
+        # Кадр візерунка: відрізати рамку 3D; augment теж зосереджений на центрі, не на однаковому «борту».
+        pair_augment_inset_ratio: float = 0.10,
+        # Порівняння пар: трохи глибший inset — менше ваги «жовтого поля» / рамки, більше центру символу.
+        pair_default_inset_ratio: float = 0.11,
+        pair_compare_use_clahe: bool = True,
+        pair_compare_size: int = 64,
+        # Друга перевірка пари: збіг градієнтів (контури символу). Різні іконки на однаковому тлі дають низький edge-score.
+        # За замовчуванням вимкнено: інакше при суворих порогах не лишається жодної прийнятої пари.
+        pair_edge_gate_enabled: bool = False,
+        pair_edge_min_score: float = 0.36,
+        # Злиття детекцій: строгий прохід + м’який (більше фішок на полі без очікування «нуля пар»).
+        merge_relaxed_delta: float = 0.11,
+        merge_relaxed_floor: float = 0.37,
+        # Паралельний matchTemplate по різних шаблонах (якщо шаблонів достатньо).
+        parallel_template_workers: int = 0,
+        min_templates_for_parallel: int = 6,
     ) -> None:
         self.templates_dir = Path(templates_dir)
         self.threshold = threshold
@@ -58,6 +110,32 @@ class VisionEngine:
         self.auto_scale_reuse = bool(auto_scale_reuse)
         self.auto_scale_reuse_half_span = float(auto_scale_reuse_half_span)
         self.auto_scale_reuse_min_avg = float(auto_scale_reuse_min_avg)
+        self.filter_darkened_tiles = bool(filter_darkened_tiles)
+        self.luma_inset_ratio = float(luma_inset_ratio)
+        self.luma_min_cluster_separation = float(luma_min_cluster_separation)
+        self.luma_min_matches = max(4, int(luma_min_matches))
+        self.luma_rollback_min_keep_ratio = float(luma_rollback_min_keep_ratio)
+        self.pair_visual_same_type = float(pair_visual_same_type)
+        self.pair_visual_cross_type = float(pair_visual_cross_type)
+        self.pair_trust_template_conf = float(pair_trust_template_conf)
+        self.pair_visual_if_trusted = float(pair_visual_if_trusted)
+        self.pair_visual_cross_augment = float(pair_visual_cross_augment)
+        self.pair_skip_visual_min_conf = float(pair_skip_visual_min_conf)
+        self.pair_augment_inset_ratio = float(pair_augment_inset_ratio)
+        self.pair_default_inset_ratio = float(pair_default_inset_ratio)
+        self.pair_compare_use_clahe = bool(pair_compare_use_clahe)
+        self.pair_compare_size = max(32, int(pair_compare_size))
+        self.pair_edge_gate_enabled = bool(pair_edge_gate_enabled)
+        self.pair_edge_min_score = float(pair_edge_min_score)
+        self.merge_relaxed_delta = float(merge_relaxed_delta)
+        self.merge_relaxed_floor = float(merge_relaxed_floor)
+        pw = int(parallel_template_workers)
+        self.parallel_template_workers = pw if pw > 0 else max(
+            1, min(8, (os.cpu_count() or 4))
+        )
+        self.min_templates_for_parallel = max(3, int(min_templates_for_parallel))
+        # М’якший CLAHE — менше штучних відмінностей між двома копіями однієї фішки.
+        self._clahe_pair = cv2.createCLAHE(clipLimit=1.65, tileGridSize=(8, 8))
         self._last_auto_scale: Optional[float] = None
         self.templates: Dict[str, np.ndarray] = {}
         self.load_templates()
@@ -123,10 +201,56 @@ class VisionEngine:
         )
         return frame_bgr, cap_rect
 
+    def _detect_single_template(
+        self,
+        tile_type: str,
+        template: np.ndarray,
+        frame_gray: np.ndarray,
+        scale: float,
+        eff_threshold: float,
+    ) -> List[TileMatch]:
+        """Один шаблон на кадрі + локальний NMS (для паралельного запуску)."""
+        scaled_template = self._scale_template(template, scale)
+        h, w = scaled_template.shape[:2]
+        if h < 5 or w < 5 or h > frame_gray.shape[0] or w > frame_gray.shape[1]:
+            return []
+        result = cv2.matchTemplate(frame_gray, scaled_template, cv2.TM_CCOEFF_NORMED)
+        ys, xs = np.where(result >= eff_threshold)
+        tile_matches: List[TileMatch] = []
+        for x, y in zip(xs, ys):
+            score = float(result[y, x])
+            tile_matches.append(
+                TileMatch(
+                    tile_type=tile_type,
+                    confidence=score,
+                    x=int(x),
+                    y=int(y),
+                    w=int(w),
+                    h=int(h),
+                )
+            )
+        return self._non_max_suppression(tile_matches, iou_threshold=0.30)
+
     def find_templates(
-        self, frame_bgr: np.ndarray
+        self,
+        frame_bgr: np.ndarray,
+        threshold: Optional[float] = None,
+        apply_darkened_filter: Optional[bool] = None,
     ) -> Tuple[List[TileMatch], Dict[str, List[TileMatch]]]:
-        """Шукає всі шаблони на кадрі через cv2.matchTemplate."""
+        """
+        Шукає всі типи плиток на кадрі.
+
+        Для кожного шаблону — ``cv2.matchTemplate(..., TM_CCOEFF_NORMED)`` по всьому кадру;
+        це стандартний спосіб знайти ділянки, візуально збігаються з еталоном плитки.
+
+        ``threshold`` — перевизначити поріг збігу; ``apply_darkened_filter`` — чи застосовувати відсікання затемнених.
+        """
+        eff_threshold = float(self.threshold if threshold is None else threshold)
+        use_luma = (
+            self.filter_darkened_tiles
+            if apply_darkened_filter is None
+            else bool(apply_darkened_filter)
+        )
         frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         scale = self.template_scale
         if self.auto_scale:
@@ -134,39 +258,229 @@ class VisionEngine:
             self._last_auto_scale = scale
 
         all_matches: List[TileMatch] = []
+        template_items = list(self.templates.items())
+        use_parallel = len(template_items) >= self.min_templates_for_parallel
 
-        for tile_type, template in self.templates.items():
-            scaled_template = self._scale_template(template, scale)
-            h, w = scaled_template.shape[:2]
-            if h < 5 or w < 5 or h > frame_gray.shape[0] or w > frame_gray.shape[1]:
-                continue
-            result = cv2.matchTemplate(frame_gray, scaled_template, cv2.TM_CCOEFF_NORMED)
-            ys, xs = np.where(result >= self.threshold)
-
-            tile_matches: List[TileMatch] = []
-            for x, y in zip(xs, ys):
-                score = float(result[y, x])
-                tile_matches.append(
-                    TileMatch(
-                        tile_type=tile_type,
-                        confidence=score,
-                        x=int(x),
-                        y=int(y),
-                        w=int(w),
-                        h=int(h),
+        if use_parallel:
+            workers = min(self.parallel_template_workers, len(template_items))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(
+                        self._detect_single_template,
+                        tt,
+                        tpl,
+                        frame_gray,
+                        scale,
+                        eff_threshold,
+                    )
+                    for tt, tpl in template_items
+                ]
+                for fu in as_completed(futures):
+                    all_matches.extend(fu.result())
+        else:
+            for tile_type, template in template_items:
+                all_matches.extend(
+                    self._detect_single_template(
+                        tile_type,
+                        template,
+                        frame_gray,
+                        scale,
+                        eff_threshold,
                     )
                 )
-
-            # Відсікаємо дублікати, які виникають поруч у matchTemplate.
-            tile_matches = self._non_max_suppression(tile_matches, iou_threshold=0.30)
-            all_matches.extend(tile_matches)
 
         # Глобальний NMS між усіма класами: прибирає рамки, що сильно накладаються.
         global_nms = self._non_max_suppression(all_matches, iou_threshold=0.35)
         # Winner-takes-all: для кожної фізичної плитки залишаємо лише мітку з найвищим score.
         final_matches = self._winner_takes_all(global_nms, center_radius_ratio=0.35)
+        if use_luma:
+            final_matches = self._filter_reference_style_dimmed(
+                frame_gray, final_matches
+            )
         grouped = self._group_by_type(final_matches)
         return final_matches, grouped
+
+    def find_templates_merged(
+        self,
+        frame_bgr: np.ndarray,
+        threshold: Optional[float] = None,
+        relaxed_delta: Optional[float] = None,
+        relaxed_floor: Optional[float] = None,
+    ) -> Tuple[List[TileMatch], Dict[str, List[TileMatch]]]:
+        """
+        Два проходи шаблону: основний (із затемненням як у ``find_templates``) +
+        м’який без фільтра яскравості. Об’єднує списки, потім NMS + WTA.
+
+        Так знаходяться фішки на краях поля / при іншому світлі, навіть коли вже
+        є інші детекції (раніше м’який поріг викликався лише якщо пар не було взагалі).
+        """
+        eff = float(self.threshold if threshold is None else threshold)
+        rd = (
+            self.merge_relaxed_delta
+            if relaxed_delta is None
+            else float(relaxed_delta)
+        )
+        rf = (
+            self.merge_relaxed_floor if relaxed_floor is None else float(relaxed_floor)
+        )
+        m_strict, _ = self.find_templates(
+            frame_bgr,
+            threshold=eff,
+            apply_darkened_filter=None,
+        )
+        th_lo = max(rf, eff - rd)
+        m_loose, _ = self.find_templates(
+            frame_bgr,
+            threshold=th_lo,
+            apply_darkened_filter=False,
+        )
+        combined = m_strict + m_loose
+        global_nms = self._non_max_suppression(combined, iou_threshold=0.35)
+        final_matches = self._winner_takes_all(global_nms, center_radius_ratio=0.35)
+        grouped = self._group_by_type(final_matches)
+        if final_matches:
+            return final_matches, grouped
+        # Обидва шари порожні (поріг / масштаб / світло) — один запасний прохід без затемнення.
+        th_rescue = max(0.30, min(0.42, float(eff) - 0.22))
+        return self.find_templates(
+            frame_bgr,
+            threshold=float(th_rescue),
+            apply_darkened_filter=False,
+        )
+
+    def _tile_match_mean_luma(
+        self, frame_gray: np.ndarray, match: TileMatch
+    ) -> float:
+        """Середня яскравість сірої внутрішньої частини рамки (без країв шаблону)."""
+        inset = self.luma_inset_ratio
+        x, y, w, h = match.x, match.y, match.w, match.h
+        dx = max(1, int(round(w * inset)))
+        dy = max(1, int(round(h * inset)))
+        x1, y1 = x + dx, y + dy
+        x2, y2 = x + w - dx, y + h - dy
+        hg, wg = frame_gray.shape[:2]
+        x1 = max(0, min(x1, wg - 1))
+        y1 = max(0, min(y1, hg - 1))
+        x2 = max(x1 + 1, min(x2, wg))
+        y2 = max(y1 + 1, min(y2, hg))
+        patch = frame_gray[y1:y2, x1:x2]
+        if patch.size == 0:
+            y2o = min(y + h, hg)
+            x2o = min(x + w, wg)
+            patch = frame_gray[y:y2o, x:x2o]
+        if patch.size == 0:
+            return 0.0
+        return float(np.mean(patch))
+
+    def _luma_keep_bright_cluster_mask(
+        self, lumas: np.ndarray
+    ) -> Optional[np.ndarray]:
+        """
+        Двокластерний поділ за яскравістю (k-means у 1D).
+        Повертає маску True для плиток «яскравішого» кластера або None, якщо розділення ненадійне.
+        """
+        v = lumas.astype(np.float64)
+        n = len(v)
+        if n < self.luma_min_matches:
+            return None
+        lo = float(np.percentile(v, 22))
+        hi = float(np.percentile(v, 78))
+        if hi - lo < 1.5:
+            lo, hi = float(v.min()), float(v.max())
+        min_sep = self.luma_min_cluster_separation
+
+        for _ in range(60):
+            dist_lo = np.abs(v - lo)
+            dist_hi = np.abs(v - hi)
+            mask_lo = dist_lo < dist_hi
+            same = dist_lo == dist_hi
+            if np.any(same):
+                mask_lo = np.where(same, True, mask_lo)
+            if np.sum(mask_lo) == 0 or np.sum(~mask_lo) == 0:
+                return None
+            lo_new = float(v[mask_lo].mean())
+            hi_new = float(v[~mask_lo].mean())
+            if hi_new < lo_new:
+                lo_new, hi_new = hi_new, lo_new
+            shift = abs(lo_new - lo) + abs(hi_new - hi)
+            lo, hi = lo_new, hi_new
+            if shift < 1e-4:
+                break
+
+        bright_c = max(lo, hi)
+        dark_c = min(lo, hi)
+        if bright_c - dark_c < min_sep:
+            return None
+
+        d_lo = np.abs(v - dark_c)
+        d_hi = np.abs(v - bright_c)
+        # Залишаємо кластер ближчий до яскравішого центроїду (затемнені — до нижнього).
+        return d_hi < d_lo
+
+    def _filter_reference_style_dimmed(
+        self,
+        frame_gray: np.ndarray,
+        matches: List[TileMatch],
+    ) -> List[TileMatch]:
+        """
+        Прибирає зі списку фішки з сильним затемненням (гейм-дизайн: недоступні хід).
+
+        Орієнтир — референсні скріни в assets/reference_boards: там видно різницю яскравості
+        між доступними та закритими плитками.
+        """
+        if not matches:
+            return matches
+        lumas_list = [self._tile_match_mean_luma(frame_gray, m) for m in matches]
+        lumas = np.array(lumas_list, dtype=np.float64)
+        keep_mask = self._luma_keep_bright_cluster_mask(lumas)
+        if keep_mask is None:
+            return [
+                TileMatch(
+                    tile_type=m.tile_type,
+                    confidence=m.confidence,
+                    x=m.x,
+                    y=m.y,
+                    w=m.w,
+                    h=m.h,
+                    luma_mean=lumas_list[i],
+                )
+                for i, m in enumerate(matches)
+            ]
+        out: List[TileMatch] = []
+        for i, m in enumerate(matches):
+            if not keep_mask[i]:
+                continue
+            out.append(
+                TileMatch(
+                    tile_type=m.tile_type,
+                    confidence=m.confidence,
+                    x=m.x,
+                    y=m.y,
+                    w=m.w,
+                    h=m.h,
+                    luma_mean=float(lumas_list[i]),
+                )
+            )
+        # Занадто агресивне затемнення — губимо відкриті фішки (різні кути світла на скріні).
+        ratio = len(out) / float(len(matches)) if matches else 1.0
+        if (
+            out
+            and len(matches) >= 10
+            and ratio < self.luma_rollback_min_keep_ratio
+        ):
+            return [
+                TileMatch(
+                    tile_type=m.tile_type,
+                    confidence=m.confidence,
+                    x=m.x,
+                    y=m.y,
+                    w=m.w,
+                    h=m.h,
+                    luma_mean=lumas_list[i],
+                )
+                for i, m in enumerate(matches)
+            ]
+        return out if out else matches
 
     def _gray_preview_for_scale_search(
         self, frame_gray: np.ndarray
@@ -333,6 +647,26 @@ class VisionEngine:
             return np.array([], dtype=np.uint8)
         return gray[y1:y2, x1:x2]
 
+    def _pair_edge_match_score(
+        self, a_u8: np.ndarray, b_u8: np.ndarray, cs: int
+    ) -> float:
+        """Збіг карт градієнтів (контури символу), стійкіший до спільного кольору тла."""
+        if a_u8.size < 9 or b_u8.size < 9:
+            return 0.0
+        gx = cv2.Sobel(a_u8, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(a_u8, cv2.CV_32F, 0, 1, ksize=3)
+        ea = cv2.magnitude(gx, gy)
+        gx2 = cv2.Sobel(b_u8, cv2.CV_32F, 1, 0, ksize=3)
+        gy2 = cv2.Sobel(b_u8, cv2.CV_32F, 0, 1, ksize=3)
+        eb = cv2.magnitude(gx2, gy2)
+        ea_u8 = cv2.normalize(ea, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        eb_u8 = cv2.normalize(eb, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        ar = cv2.resize(ea_u8, (cs, cs), interpolation=cv2.INTER_AREA)
+        br = cv2.resize(eb_u8, (cs, cs), interpolation=cv2.INTER_AREA)
+        s1 = float(cv2.matchTemplate(ar, br, cv2.TM_CCOEFF_NORMED)[0, 0])
+        s2 = float(cv2.matchTemplate(br, ar, cv2.TM_CCOEFF_NORMED)[0, 0])
+        return max(s1, s2)
+
     def pair_patches_look_same(
         self,
         frame_bgr: np.ndarray,
@@ -345,35 +679,109 @@ class VisionEngine:
         bw: int,
         bh: int,
         inset_ratio: float = 0.08,
-        compare_size: int = 80,
+        compare_size: Optional[int] = None,
         min_normalized_score: float = 0.72,
+        allow_narrow_retry: bool = True,
+        edge_min_score: Optional[float] = None,
     ) -> bool:
         """
         Чи виглядають дві області кадру як одна й та сама плитка (незалежно від імені шаблону).
 
         Потрібно, бо інколи WTA/шаблони дають однаковий tile_type різним малюнкам.
+        Порівняння — ``matchTemplate`` на ROI + окремо на карті градієнтів (менше хибних
+        пар через однаковий колір тла без однакового символу).
+
+        Якщо перший виріз не пройшов — повтор із вужчим inset; на retry поріг сірого трохи
+        послаблюється; поріг градієнтів теж трохи знижується на retry.
+        Якщо CLAHE розводить два центри однієї фішки — додаткова спроба на сірому без CLAHE.
         """
+        emin = (
+            float(edge_min_score)
+            if edge_min_score is not None
+            else float(self.pair_edge_min_score)
+        )
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         a = self._gray_roi_inset(gray, ax, ay, aw, ah, inset_ratio)
         b = self._gray_roi_inset(gray, bx, by, bw, bh, inset_ratio)
         if a.size < 24 or b.size < 24:
+            if allow_narrow_retry and inset_ratio > 0.028:
+                narrow = max(0.02, inset_ratio * 0.42)
+                thr_retry = max(0.42, float(min_normalized_score) - 0.02)
+                em_retry = max(0.30, emin - 0.025)
+                return self.pair_patches_look_same(
+                    frame_bgr,
+                    ax,
+                    ay,
+                    aw,
+                    ah,
+                    bx,
+                    by,
+                    bw,
+                    bh,
+                    inset_ratio=narrow,
+                    compare_size=compare_size,
+                    min_normalized_score=thr_retry,
+                    allow_narrow_retry=False,
+                    edge_min_score=em_retry,
+                )
             return False
-        a_r = cv2.resize(
-            a, (compare_size, compare_size), interpolation=cv2.INTER_AREA
-        )
-        b_r = cv2.resize(
-            b, (compare_size, compare_size), interpolation=cv2.INTER_AREA
-        )
-        s1 = float(cv2.matchTemplate(a_r, b_r, cv2.TM_CCOEFF_NORMED)[0, 0])
-        s2 = float(cv2.matchTemplate(b_r, a_r, cv2.TM_CCOEFF_NORMED)[0, 0])
-        return max(s1, s2) >= min_normalized_score
+        cs = self.pair_compare_size if compare_size is None else int(compare_size)
+
+        def _pair_match_score(a_u8: np.ndarray, b_u8: np.ndarray, use_clahe: bool) -> float:
+            aa, bb = a_u8, b_u8
+            if use_clahe and self.pair_compare_use_clahe:
+                aa = self._clahe_pair.apply(aa)
+                bb = self._clahe_pair.apply(bb)
+            a_r = cv2.resize(aa, (cs, cs), interpolation=cv2.INTER_AREA)
+            b_r = cv2.resize(bb, (cs, cs), interpolation=cv2.INTER_AREA)
+            s1 = float(cv2.matchTemplate(a_r, b_r, cv2.TM_CCOEFF_NORMED)[0, 0])
+            s2 = float(cv2.matchTemplate(b_r, a_r, cv2.TM_CCOEFF_NORMED)[0, 0])
+            return max(s1, s2)
+
+        best = _pair_match_score(a, b, use_clahe=True)
+        if self.pair_compare_use_clahe:
+            best = max(best, _pair_match_score(a, b, use_clahe=False))
+        edge_best = self._pair_edge_match_score(a, b, cs)
+        gray_ok = best >= min_normalized_score
+        edge_ok = (not self.pair_edge_gate_enabled) or (edge_best >= emin)
+        ok = gray_ok and edge_ok
+        if ok:
+            return True
+        if allow_narrow_retry and inset_ratio > 0.028:
+            narrow = max(0.02, inset_ratio * 0.42)
+            thr_retry = max(0.42, float(min_normalized_score) - 0.02)
+            em_retry = max(0.30, emin - 0.025)
+            return self.pair_patches_look_same(
+                frame_bgr,
+                ax,
+                ay,
+                aw,
+                ah,
+                bx,
+                by,
+                bw,
+                bh,
+                inset_ratio=narrow,
+                compare_size=compare_size,
+                min_normalized_score=thr_retry,
+                allow_narrow_retry=False,
+                edge_min_score=em_retry,
+            )
+        return False
 
     def analyze_once(
-        self, region: Optional[Tuple[int, int, int, int]] = None
+        self,
+        region: Optional[Tuple[int, int, int, int]] = None,
+        template_threshold: Optional[float] = None,
+        apply_darkened_filter: Optional[bool] = None,
     ) -> Tuple[np.ndarray, List[TileMatch], Dict[str, List[TileMatch]], Tuple[int, int, int, int]]:
         """Один цикл: захват екрана + пошук шаблонів + прямокутник захвату для оверлею."""
         frame, cap_rect = self.capture_screen(region=region)
-        matches, grouped = self.find_templates(frame)
+        matches, grouped = self.find_templates(
+            frame,
+            threshold=template_threshold,
+            apply_darkened_filter=apply_darkened_filter,
+        )
         return frame, matches, grouped, cap_rect
 
     @staticmethod
