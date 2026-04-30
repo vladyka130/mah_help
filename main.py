@@ -7,6 +7,7 @@ import tkinter as tk
 from dataclasses import dataclass
 from tkinter import messagebox
 
+import cv2
 import customtkinter as ctk
 
 from engine import EngineTile, MahjongEngine, PairCandidate
@@ -21,17 +22,27 @@ else:
 # Товщина фіолетових рамок навколо кожної валідної пари.
 _OVERLAY_STROKE_PURPLE = 4
 
-# Автоклік: пауза між двома плитками пари та після пари (анімація гри).
-_AUTO_PAUSE_BETWEEN_TILE_CLICKS_SEC = 0.18
-_AUTO_PAUSE_AFTER_PAIR_SEC = 0.72
-# Коротка пауза після оновлення оверлею, щоб головний потік встиг намалювати.
-_AUTO_PAUSE_AFTER_UI_SEC = 0.12
+# Автоклік: мінімальні паузи — розпізнавання має бути «майже миттєвим», затримки лише під анімацію гри.
+_AUTO_PAUSE_BETWEEN_TILE_CLICKS_SEC = 0.04
+_AUTO_PAUSE_AFTER_PAIR_SEC = 0.12
+# Після оновлення статусу в автогра (оверлей можна не малювати — швидше цикл кліку).
+_AUTO_PAUSE_AFTER_UI_SEC = 0.01
+# У автогра не малювати фіолетові рамки кожного кадру — економія головного потоку й часу перед кліком.
+_AUTO_SKIP_OVERLAY_DRAW_IN_AUTO = True
 
 # Редагувані з GUI параметри (float на Vision / Engine). Опис — підказка у вікні.
 _PARAM_FLOAT_VISION: list[tuple[str, str]] = [
     (
         "threshold",
-        "Детекція: поріг шаблону (0.35–0.92). Нижче — більше фішок і шуму.",
+        "Детекція: поріг шаблону (0.35–0.92). Нижче — більше фішок і хибних рамок на фоні.",
+    ),
+    (
+        "detection_min_gray_std",
+        "Фільтр фону: мін. σ яскравості всередині фішки (вище — менше «пустих» рамок).",
+    ),
+    (
+        "detection_min_laplacian_var",
+        "Фільтр фону: мін. варіація Лапласіана (дрібна текстура; допомагає порівняти з однорідним тлом).",
     ),
     (
         "merge_relaxed_delta",
@@ -70,12 +81,48 @@ _PARAM_FLOAT_VISION: list[tuple[str, str]] = [
         "Поріг сірого ROI, коли обидва шаблони дуже впевнені.",
     ),
     (
+        "pair_skip_roi_same_type_min_conf",
+        "Якщо min(score) шаблону ≥ цього й тип однаковий — без ROI (швидко). 1.05 = завжди через ROI.",
+    ),
+    (
         "pair_edge_min_score",
         "Пара: мінімальний збіг градієнтів (контури символу). Вище — менше плутанини «однаковий фон».",
     ),
     (
+        "pair_center_extra_inset",
+        "Додатковий відступ для другої перевірки «тільки центр» (відсікає схожі краї, різний центр).",
+    ),
+    (
+        "pair_center_min_score_slack",
+        "На скільки послабити поріг сірого для центрового ROI відносно основного.",
+    ),
+    (
+        "pair_corner_width_ratio",
+        "Доля ширини фішки — зона верхнього лівого кута (цифра рангу).",
+    ),
+    (
+        "pair_corner_height_ratio",
+        "Доля висоти фішки — зона верхнього лівого кута.",
+    ),
+    (
+        "pair_corner_min_norm_score",
+        "Мін. збіг matchTemplate на кутах; нижче — різні ранги (2 vs 5), не пара.",
+    ),
+    (
+        "pair_hsv_hist_center_inset",
+        "Додатковий inset для кольорової гістограми H–S у центрі (схожі фішки з різним кольором візерунка).",
+    ),
+    (
+        "pair_hsv_hist_min_correl",
+        "Мін. кореляція H–S гістограм; нижче — різні фішки (9 vs 7 гачків, червоне vs синє).",
+    ),
+    (
         "luma_min_cluster_separation",
         "Фільтр затемнення: мін. відстань між кластерами яскравості (якщо фільтр увімкнено).",
+    ),
+    (
+        "luma_max_drop_from_brightest",
+        "Макс. різниця яскравості з найсвітлішою детекцією; усе що темніше — схоже на затемнену фішку.",
     ),
 ]
 _PARAM_FLOAT_ENGINE: list[tuple[str, str]] = [
@@ -97,6 +144,22 @@ _PARAM_SWITCH_VISION: list[tuple[str, str]] = [
         "pair_edge_gate_enabled",
         "Вимагати збіг градієнтів для пари (разом із сірим ROI). Вимкни — лише сірий поріг.",
     ),
+    (
+        "pair_center_gate_enabled",
+        "Друга перевірка пари на вужчому центрі (різні «майже однакові» фішки з різницею в центрі).",
+    ),
+    (
+        "pair_corner_gate_enabled",
+        "Перевірка верхнього лівого кута (цифра): різні бамбуки з однаковим шаблоном не клікаються як пара.",
+    ),
+    (
+        "pair_hsv_hist_gate_enabled",
+        "Перевірка кольору візерунка в центрі (HSV); відсіює плутанину схожих сіток з різними кольорами/кількістю елементів.",
+    ),
+    (
+        "filter_low_texture_detections",
+        "Відсіювати збіги на майже рівному фоні (менше фіолетових рамок «в нічому»).",
+    ),
 ]
 
 
@@ -117,7 +180,7 @@ def _win32_click_screen_pixel(x: int, y: int) -> None:
 
     user32 = ctypes.windll.user32
     user32.SetCursorPos(int(x), int(y))
-    time.sleep(0.04)
+    time.sleep(0.015)
     user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
     user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
 
@@ -137,11 +200,10 @@ class MahjongAssistantApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.vision = None
-        # Поріг пари трохи нижче за Vision threshold — відсікаємо слабкі збіги.
+        # Поріг пари трохи нижче за Vision threshold — відсікаємо слабкі збіги (узгоджено з дефолтами vision.py).
         # Трохи м’якші пороги геометрії — частіше визначаються «вільні» фішки на ізометричних полях.
         self.engine = MahjongEngine(
-            # Нижче поріг шаблону при злитті сканів — інакше фішки зі score ~0.48 відсікаються з пар.
-            pair_min_confidence=0.45,
+            pair_min_confidence=0.38,
             side_max_gap_ratio=0.50,
         )
         self._is_busy = False
@@ -161,7 +223,13 @@ class MahjongAssistantApp(ctk.CTk):
         self._sync_params_from_engine_to_ui()
 
         self.bind("<Escape>", lambda _e: self._on_escape_key())
-        self.bind("<F4>", lambda _e: self._on_escape_key())
+        self._global_f4_hotkeys = None
+        # Windows: глобальний F4 (pynput), щоб перемикати автогра з ігрового вікна. Інакше — лише TK F4.
+        if sys.platform == "win32":
+            self._install_global_f4_hotkey_win32()
+        else:
+            self.bind("<F4>", lambda _e: self._toggle_auto_play())
+        self.protocol("WM_DELETE_WINDOW", self._on_app_close_request)
 
     def _set_window_status(self, text: str) -> None:
         """Короткий стан у заголовку вікна (форма лише з кнопок)."""
@@ -186,7 +254,7 @@ class MahjongAssistantApp(ctk.CTk):
 
         self.clear_btn = ctk.CTkButton(
             container,
-            text="Очистити (Esc/F4)",
+            text="Очистити оверлей (Esc)",
             command=self.clear_overlay,
             width=bw,
             height=bh,
@@ -195,7 +263,7 @@ class MahjongAssistantApp(ctk.CTk):
 
         self.auto_btn = ctk.CTkButton(
             container,
-            text="Автогра (клік + аналіз циклом)",
+            text="Автогра (F4, навіть у грі)",
             command=self._toggle_auto_play,
             width=bw,
             height=bh,
@@ -291,7 +359,7 @@ class MahjongAssistantApp(ctk.CTk):
 
         tip = ctk.CTkLabel(
             scroll,
-            text="Увімкни pair_edge_gate_enabled і підніми pair_edge_min_score (~0.02), якщо плутає різні фішки; якщо пар немає — вимкни gate або знизь пороги pair_visual_*.",
+            text="pair_skip… 1.05 = завжди ROI; ~0.90 = інколи пропуск ROI при дуже високому збігу шаблону. Плутанина пар — підвищ pair_visual_* або edge.",
             font=ctk.CTkFont(size=10),
             text_color="gray70",
             wraplength=310,
@@ -402,8 +470,28 @@ class MahjongAssistantApp(ctk.CTk):
                 return max(0.28, min(0.85, x))
             if attr.endswith("inset_ratio"):
                 return max(0.02, min(0.45, x))
+            if attr == "pair_skip_roi_same_type_min_conf":
+                return max(0.35, min(1.08, x))
+            if attr == "detection_min_gray_std":
+                return max(6.0, min(28.0, x))
+            if attr == "detection_min_laplacian_var":
+                return max(2.0, min(80.0, x))
             if attr == "luma_min_cluster_separation":
                 return max(3.0, min(25.0, x))
+            if attr == "luma_max_drop_from_brightest":
+                return max(12.0, min(65.0, x))
+            if attr == "pair_center_extra_inset":
+                return max(0.02, min(0.25, x))
+            if attr == "pair_center_min_score_slack":
+                return max(0.01, min(0.22, x))
+            if attr in ("pair_corner_width_ratio", "pair_corner_height_ratio"):
+                return max(0.12, min(0.50, x))
+            if attr == "pair_corner_min_norm_score":
+                return max(0.40, min(0.95, x))
+            if attr == "pair_hsv_hist_center_inset":
+                return max(0.04, min(0.30, x))
+            if attr == "pair_hsv_hist_min_correl":
+                return max(0.30, min(0.95, x))
         if scope == "engine":
             if attr == "pair_min_confidence":
                 return max(0.28, min(0.88, x))
@@ -420,21 +508,11 @@ class MahjongAssistantApp(ctk.CTk):
         return bool(g)
 
     def _init_vision(self) -> None:
+        # Усі «робочі» пороги задані в vision.VisionEngine.__init__ (дефолти): панель параметрів не обов’язкова.
         try:
-            self.vision = VisionEngine(
-                templates_dir="assets/tiles",
-                threshold=0.47,
-                template_scale=1.0,
-                auto_scale=True,
-                auto_scale_range=(0.55, 1.48),
-                filter_darkened_tiles=True,
-                luma_min_cluster_separation=8.5,
-                # Градієнти для пар — за бажанням увімкни в «Параметри» (жорсткіша фільтрація).
-                pair_edge_gate_enabled=False,
-                # Решта — дефолти vision.py.
-            )
+            self.vision = VisionEngine(templates_dir="assets/tiles")
             self._set_window_status(
-                "Vision OK (шаблони завантажено; затемнені фішки — фільтр)"
+                "Vision OK; затемнені фішки відсікаються за яскравістю"
             )
         except Exception as exc:
             self._set_window_status("Помилка Vision / шаблонів")
@@ -476,40 +554,52 @@ class MahjongAssistantApp(ctk.CTk):
         tb = tile_by_id[p.second_id]
         return self._pair_visual_min_for_tiles(ta, tb)
 
-    def _analyze_once_core(self) -> AnalysisSnapshot:
-        """Повний аналіз у робочому потоці (без викликів Tk)."""
+    def _analyze_once_core(self, *, for_auto: bool = False) -> AnalysisSnapshot:
+        """Повний аналіз у робочому потоці (без викликів Tk). ``for_auto`` — швидкий шлях для автогра."""
         assert self.vision is not None
         v = self.vision
         _frame, cap_rect = v.capture_screen(region=None)
-        matches, grouped = v.find_templates_merged(_frame)
-        snap = self._snapshot_from_detection(
-            _frame, matches, grouped, cap_rect, relaxed_suffix=""
+        reuse_scale = bool(for_auto)
+        # Один базовий прохід find_templates — стабільніший за злиття двох сканів на проблемних DPI.
+        matches, grouped = v.find_templates(
+            _frame, reuse_cached_scale=reuse_scale
         )
-        # Другий прохід на тому ж кадрі: м’якший поріг шаблону + без фільтра яскравості —
-        # коли освітлення/затемнення ламають детекцію (скарби в різних кутках поля тощо).
-        if len(snap.pairs) == 0 and len(matches) >= 2:
-            th2 = max(0.36, float(v.threshold) - 0.13)
-            matches2, grouped2 = v.find_templates_merged(
+        snap = self._snapshot_from_detection(
+            _frame,
+            matches,
+            grouped,
+            cap_rect,
+            relaxed_suffix="",
+            turbo=for_auto,
+        )
+        # Другий / третій прохід — навіть якщо перший дав 0 детекцій (умова лише «нема пар»).
+        if len(snap.pairs) == 0:
+            th2 = max(0.40, float(v.threshold) - 0.11)
+            matches2, grouped2 = v.find_templates(
                 _frame,
                 threshold=th2,
+                apply_darkened_filter=None,
+                reuse_cached_scale=reuse_scale,
             )
             snap2 = self._snapshot_from_detection(
                 _frame,
                 matches2,
                 grouped2,
                 cap_rect,
-                relaxed_suffix=" | Другий прохід (м’якший поріг, без фільтра яскравості)",
+                relaxed_suffix=" | Другий прохід (м’якший поріг шаблону)",
+                turbo=for_auto,
             )
-            if len(snap2.pairs) > len(snap.pairs):
-                snap = snap2
+            if len(snap2.pairs) > len(snap.pairs) or len(matches2) > len(matches):
+                snap, matches, grouped = snap2, matches2, grouped2
 
-        # Третій прохід — максимальна чутливість шаблону (різні кути світла / край поля).
-        if len(snap.pairs) == 0 and len(matches) >= 2:
-            # Не занадто низько — інакше шаблон ловить «шум» і пари виглядають довільними.
-            th3 = max(0.38, float(v.threshold) - 0.16)
-            matches3, grouped3 = v.find_templates_merged(
+        # У автогра без третього проходу (економія ~цілого matchTemplate-циклу); ручний аналіз — повний відкат.
+        if len(snap.pairs) == 0 and not for_auto:
+            th3 = max(0.42, float(v.threshold) - 0.14)
+            matches3, grouped3 = v.find_templates(
                 _frame,
                 threshold=th3,
+                apply_darkened_filter=None,
+                reuse_cached_scale=reuse_scale,
             )
             snap3 = self._snapshot_from_detection(
                 _frame,
@@ -517,9 +607,10 @@ class MahjongAssistantApp(ctk.CTk):
                 grouped3,
                 cap_rect,
                 relaxed_suffix=" | Третій прохід (макс. чутливість)",
+                turbo=for_auto,
             )
-            if len(snap3.pairs) > len(snap.pairs):
-                snap = snap3
+            if len(snap3.pairs) > len(snap.pairs) or len(matches3) > len(matches):
+                snap, matches, grouped = snap3, matches3, grouped3
 
         return snap
 
@@ -530,16 +621,50 @@ class MahjongAssistantApp(ctk.CTk):
         grouped,
         cap_rect,
         relaxed_suffix: str,
+        *,
+        turbo: bool = False,
     ) -> AnalysisSnapshot:
-        """Збирає пари та підказку з уже знайдених детекцій."""
+        """Збирає пари та підказку з уже знайдених детекцій. ``turbo`` — прискорені перевірки ROI в автогра."""
         tiles = self.engine.build_tiles(matches)
         tile_by_id = {t.id: t for t in tiles}
         relations = self.engine.build_relations(tiles)
         free_pairs_raw = self.engine.find_free_pairs(tiles, relations)
         pairs_before_visual = len(free_pairs_raw)
         free_pairs: list[PairCandidate] = []
+        v = self.vision
+        assert v is not None
+        # Один перехід BGR→сірий на весь кадр: інакше кожна перевірка пари робить повний cvtColor.
+        frame_gray = cv2.cvtColor(_frame, cv2.COLOR_BGR2GRAY)
         for p in free_pairs_raw:
-            if self.vision.pair_patches_look_same(
+            ta = tile_by_id[p.first_id]
+            tb = tile_by_id[p.second_id]
+            same_named_type = (
+                "|" not in p.tile_type
+                and not str(p.pair_id).startswith("visual:")
+                and ta.tile_type == tb.tile_type
+            )
+            # Бамбук 2 vs 5: навіть якщо шаблон дав один тип — верхній лівий кут (цифра) має збігатися.
+            if same_named_type and v.pair_corner_gate_enabled:
+                if not v.pair_top_left_corners_look_same(
+                    frame_gray,
+                    ta.x,
+                    ta.y,
+                    ta.w,
+                    ta.h,
+                    tb.x,
+                    tb.y,
+                    tb.w,
+                    tb.h,
+                ):
+                    continue
+            # Довіра до шаблону для однакового типу — як у простішій збірці (менше «відсіяно за зображенням»).
+            skip_roi = same_named_type and min(ta.confidence, tb.confidence) >= float(
+                v.pair_skip_roi_same_type_min_conf
+            )
+            if skip_roi:
+                free_pairs.append(p)
+                continue
+            if v.pair_patches_look_same(
                 _frame,
                 p.first_coords[0],
                 p.first_coords[1],
@@ -549,41 +674,45 @@ class MahjongAssistantApp(ctk.CTk):
                 p.second_coords[1],
                 p.second_w,
                 p.second_h,
-                inset_ratio=self.vision.pair_default_inset_ratio,
+                inset_ratio=v.pair_default_inset_ratio,
                 min_normalized_score=self._pair_visual_min_for_candidate(
                     p, tile_by_id
                 ),
+                frame_gray=frame_gray,
+                fast=turbo,
             ):
                 free_pairs.append(p)
         pairs_visual_dropped = pairs_before_visual - len(free_pairs)
 
-        # Різні імена шаблонів при однаковому малюнку (квіти, схожі символи) — окремий м’якший поріг + inset.
-        v = self.vision
-        assert v is not None
+        # Різні імена шаблонів при однаковому малюнку — augment це O(k²) візуальних викликів;
+        # у turbo пропускаємо, якщо вже є хоча б одна валідна пара (типовий випадок ~100 фішок).
+        if not (turbo and len(free_pairs) > 0):
 
-        def _augment_visual_same(a: EngineTile, b: EngineTile) -> bool:
-            return bool(
-                v.pair_patches_look_same(
-                    _frame,
-                    a.x,
-                    a.y,
-                    a.w,
-                    a.h,
-                    b.x,
-                    b.y,
-                    b.w,
-                    b.h,
-                    inset_ratio=v.pair_augment_inset_ratio,
-                    min_normalized_score=v.pair_visual_cross_augment,
+            def _augment_visual_same(a: EngineTile, b: EngineTile) -> bool:
+                return bool(
+                    v.pair_patches_look_same(
+                        _frame,
+                        a.x,
+                        a.y,
+                        a.w,
+                        a.h,
+                        b.x,
+                        b.y,
+                        b.w,
+                        b.h,
+                        inset_ratio=v.pair_augment_inset_ratio,
+                        min_normalized_score=v.pair_visual_cross_augment,
+                        frame_gray=frame_gray,
+                        fast=turbo,
+                    )
                 )
-            )
 
-        free_pairs = self.engine.augment_free_pairs_cross_type_visual(
-            free_pairs,
-            tiles,
-            relations,
-            _augment_visual_same,
-        )
+            free_pairs = self.engine.augment_free_pairs_cross_type_visual(
+                free_pairs,
+                tiles,
+                relations,
+                _augment_visual_same,
+            )
 
         # Вибір «найкращої» пари лише в Python: максимальний unlock_score у MahjongEngine.
         if not free_pairs:
@@ -646,12 +775,13 @@ class MahjongAssistantApp(ctk.CTk):
         else:
             extra = " | Автогра…"
         self._set_window_status(snap.summary + extra)
-        self._draw_overlay(
-            snap.pairs,
-            snap.selected_pair,
-            snap.lm_response,
-            snap.capture_rect,
-        )
+        if not (_AUTO_SKIP_OVERLAY_DRAW_IN_AUTO and self._auto_active):
+            self._draw_overlay(
+                snap.pairs,
+                snap.selected_pair,
+                snap.lm_response,
+                snap.capture_rect,
+            )
 
     def _click_pair_centers_screen(
         self, pair: PairCandidate, cap_left: int, cap_top: int
@@ -701,7 +831,7 @@ class MahjongAssistantApp(ctk.CTk):
         try:
             cycle_step = 0
             while not self._auto_stop_requested:
-                snap = self._analyze_once_core()
+                snap = self._analyze_once_core(for_auto=True)
                 if self._auto_stop_requested:
                     break
                 if not snap.pairs or snap.selected_pair is None:
@@ -745,13 +875,69 @@ class MahjongAssistantApp(ctk.CTk):
         self._is_busy = False
         self.analyze_btn.configure(state="normal")
         self.auto_btn.configure(
-            text="Автогра (клік + аналіз циклом)",
+            text="Автогра (F4, навіть у грі)",
             fg_color="#2d6a4f",
             hover_color="#1b4332",
         )
 
     def _on_escape_key(self) -> None:
         self.clear_overlay()
+
+    def _install_global_f4_hotkey_win32(self) -> None:
+        """
+        Глобальна гаряча клавіша F4 (працює при фокусі на грі).
+        Потрібен пакет pynput; інакше лишається лише F4, коли активне вікно помічника.
+        """
+
+        def bind_f4_local() -> None:
+            self.bind("<F4>", lambda _e: self._toggle_auto_play())
+
+        def on_global_f4() -> None:
+            try:
+                self.after(0, self._toggle_auto_play)
+            except Exception:
+                pass
+
+        try:
+            from pynput.keyboard import GlobalHotKeys
+        except ImportError:
+            bind_f4_local()
+            self.after(
+                200,
+                lambda: self._set_window_status(
+                    "Глобальний F4: pip install pynput (поки лише F4 у вікні програми)"
+                ),
+            )
+            return
+
+        def run_hotkey_thread() -> None:
+            try:
+                hk = GlobalHotKeys({"<f4>": on_global_f4})
+                self._global_f4_hotkeys = hk
+                hk.start()
+            except Exception:
+                self.after(0, bind_f4_local)
+                self.after(
+                    200,
+                    lambda: self._set_window_status(
+                        "F4 глобально не вдалось — використовуйте F4 у вікні помічника"
+                    ),
+                )
+
+        threading.Thread(target=run_hotkey_thread, daemon=True).start()
+
+    def _on_app_close_request(self) -> None:
+        """Зупинка слухача F4 і закриття вікна."""
+        self._auto_stop_requested = True
+        hk = getattr(self, "_global_f4_hotkeys", None)
+        if hk is not None:
+            try:
+                hk.stop()
+            except Exception:
+                pass
+            self._global_f4_hotkeys = None
+        self.quit()
+        self.destroy()
 
     def _finish_analysis(self, message: str, error: str | None) -> None:
         self._is_busy = False
@@ -840,8 +1026,9 @@ class MahjongAssistantApp(ctk.CTk):
                 cvs, pair, "#bb33ff", _OVERLAY_STROKE_PURPLE
             )
         if selected_pair:
-            expected_unlocks = int(
-                lm_response.get("expected_unlocks", selected_pair.unlock_score)
+            expected_unlocks = max(
+                0,
+                int(lm_response.get("expected_unlocks", selected_pair.unlock_score)),
             )
             tip_text = f"Рекомендовано: ~{expected_unlocks} плиток"
             tx = min(

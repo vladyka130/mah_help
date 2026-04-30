@@ -62,8 +62,9 @@ def build_overlay_bitmap(
         )
 
     if selected_pair:
-        expected_unlocks = int(
-            lm_response.get("expected_unlocks", selected_pair.unlock_score)
+        expected_unlocks = max(
+            0,
+            int(lm_response.get("expected_unlocks", selected_pair.unlock_score)),
         )
         tip = f"Рекомендовано: відкриє ~{expected_unlocks} плиток"
         tx = min(selected_pair.first_coords[0], selected_pair.second_coords[0])
